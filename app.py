@@ -11,7 +11,7 @@ from matcher.join_detector import detect_join_keys
 from matcher.profiler import summarize_table_profile
 
 # ==========================================
-# 🔐 보안 모듈
+# 🔐 보안 모듈 (수정 금지 영역)
 # ==========================================
 def check_password():
     def password_entered():
@@ -35,8 +35,6 @@ def check_password():
 if not check_password():
     st.stop()
 
-
-
 # 1. 페이지 설정
 st.set_page_config(page_title="스키마 탐지기 Pro", layout="wide")
 st.title("🔍 테이블 스키마 탐지 & Join Key 분석기")
@@ -59,21 +57,52 @@ def get_cached_profile(file_bytes, table_id, sheet_name):
     return profile
 
 # ---------------------------------------------------------
-# [로직] 전략적 PK 분석 (확정 시 후보 미출력 유지)
+# [로직 변경] 전략적 PK 분석 (Best Effort 방식 적용)
 # ---------------------------------------------------------
 def analyze_strategic_pks(df):
     if df is None or df.empty: return pd.DataFrame(), 0
     total_rows = len(df)
     target_cols = [col for col in df.columns if df[col].notnull().any()]
     results = []
+    
+    # 1. 단일 PK 검사 (100% 확정 탐색)
     for col in target_cols:
-        if df[col].nunique() == total_rows:
+        nunique = df[col].nunique()
+        if nunique == total_rows:
             results.append({"구분": "단일 PK", "컬럼 1": col, "컬럼 2": "-", "컬럼 3": "-", "유일성(%)": 100.0, "상태": "✅ 확정"})
-    if results: return pd.DataFrame(results), total_rows
-    return pd.DataFrame(), total_rows
+    
+    # 단일 PK 확정 건이 있으면 해당 결과만 반환 (기존 로직 유지)
+    if results: 
+        return pd.DataFrame(results), total_rows
+
+    # 2. [신규 로직] 확정 건이 없을 경우 후보군 분석 (Best Effort)
+    # 유일성 수치가 높은 상위 10개 컬럼 추출
+    top_potential = sorted(target_cols, key=lambda c: df[c].nunique(), reverse=True)[:10]
+    
+    for col in top_potential:
+        nunique = df[col].nunique()
+        uniqueness = round((nunique / total_rows) * 100, 2)
+        results.append({
+            "구분": "단일 PK", "컬럼 1": col, "컬럼 2": "-", "컬럼 3": "-", 
+            "유일성(%)": uniqueness, "상태": "⚠️ 후보"
+        })
+        
+    # 복합 PK 조합 분석 (2개 조합 중 유일성 80% 이상인 것들)
+    for combo in combinations(top_potential, 2):
+        distinct_count = len(df.groupby(list(combo)).size())
+        uniqueness = round((distinct_count / total_rows) * 100, 2)
+        if uniqueness > 80:
+            results.append({
+                "구분": "복합 PK (2개)", "컬럼 1": combo[0], "컬럼 2": combo[1], 
+                "컬럼 3": "-", "유일성(%)": uniqueness, "상태": "⚠️ 후보"
+            })
+    
+    # 유일성 높은 순으로 정렬 후 상위 10개만 표시
+    res_df = pd.DataFrame(results).sort_values(by="유일성(%)", ascending=False).head(10).reset_index(drop=True)
+    return res_df, total_rows
 
 # ---------------------------------------------------------
-# 2. 사이드바 (자동 탐지 기본값)
+# 2. 사이드바 (레이아웃 유지)
 # ---------------------------------------------------------
 st.sidebar.header("⚙️ 분석 설정")
 w_name = st.sidebar.number_input("Name Similarity", 0.0, 1.0, 0.30, 0.05)
@@ -85,7 +114,7 @@ st.sidebar.markdown("---")
 rel_type_input = st.sidebar.radio("테이블 관계 설정", ["자동 탐지", "1:1", "1:N", "N:1"], index=0)
 
 # ---------------------------------------------------------
-# 3. 메인 레이아웃 (파일 업로드 영역 나란히)
+# 3. 메인 레이아웃 (레이아웃 유지)
 # ---------------------------------------------------------
 col_up1, col_up2 = st.columns(2)
 with col_up1:
@@ -109,6 +138,7 @@ if file_a:
         
         # 소스 PK 탐색
         df_pk_res_a, _ = analyze_strategic_pks(profile_a.sample_df)
+        # 결과가 있으면 첫 번째 행의 컬럼을 대표 PK로 설정
         pk_a = df_pk_res_a.iloc[0]["컬럼 1"] if not df_pk_res_a.empty else "MODEL_CODE"
 
         st.success(f"전수 분석 완료 (유효 행 수: {row_count_a}) ✅")
@@ -126,10 +156,10 @@ if file_a:
             st.table(pd.DataFrame({"중복 데이터": dupes[dupes>1].index, "건수": dupes[dupes>1].values}).head(10))
 
         st.markdown("### 📊 상세 PK 분석 결과")
-        st.table(df_pk_res_a.head(10))
+        st.table(df_pk_res_a)
 
         # ---------------------------------------------------------
-        # 4. 소스-타겟 매칭 분석 및 ERD/SQL (PK 누락 교정)
+        # 4. 소스-타겟 매칭 분석 및 ERD/SQL
         # ---------------------------------------------------------
         if file_b:
             profile_b = get_cached_profile(file_b.getvalue(), "TGT", sheet_b)
@@ -138,7 +168,7 @@ if file_a:
             row_count_b = len(profile_b.sample_df)
             full_nunique_map_b = {col: profile_b.sample_df[col].nunique() for col in profile_b.sample_df.columns}
             
-            # 타겟 PK 탐색 (ITEM_ID)
+            # 타겟 PK 탐색
             df_pk_res_b, _ = analyze_strategic_pks(profile_b.sample_df)
             pk_b = df_pk_res_b.iloc[0]["컬럼 1"] if not df_pk_res_b.empty else "ITEM_ID"
 
@@ -164,27 +194,20 @@ if file_a:
             dot = Digraph(comment="ERD"); dot.attr(rankdir="LR")
             
             def make_node(t_name, pk_col, join_col):
-                # 중복 제거 및 요청 컬럼만 표시
                 display_cols = [pk_col]
                 if join_col != pk_col: display_cols.append(join_col)
-                
                 rows = "".join([f'<TR><TD ALIGN="LEFT" BGCOLOR="{"#D1E9F6" if c==join_col else "white"}">{"🔑 " if c==pk_col else "   "}{c}</TD></TR>' for c in display_cols])
                 return f'<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0"><TR><TD BGCOLOR="#F4B2AF"><B>{t_name}</B></TD></TR>{rows}</TABLE>>'
 
-            # [핵심 교정] 관계에 따른 Many(N) 좌측 배치 및 PK(ITEM_ID) 포함
             if rel_final == "N:1":
-                # 소스(A)가 Many, 타겟(B)이 One
                 dot.node("N", label=make_node(profile_a.table_name, pk_a, top_m['A_column']), shape="plaintext")
                 dot.node("1", label=make_node(profile_b.table_name, pk_b, top_m['B_column']), shape="plaintext")
                 dot.edge("N", "1", label="N:1", arrowhead="none", arrowtail="crow", dir="both")
-                # SQL: N(A) 기준 LEFT JOIN 1(B)
                 sql = f"SELECT\n    A.{pk_a},\n    A.{top_m['A_column']},\n    B.{pk_b}\nFROM {profile_a.table_name} A\nLEFT JOIN {profile_b.table_name} B\n    ON A.{top_m['A_column']} = B.{top_m['B_column']}\nWHERE A.{top_m['A_column']} IS NOT NULL;"
             elif rel_final == "1:N":
-                # 타겟(B)이 Many, 소스(A)가 One
                 dot.node("N", label=make_node(profile_b.table_name, pk_b, top_m['B_column']), shape="plaintext")
                 dot.node("1", label=make_node(profile_a.table_name, pk_a, top_m['A_column']), shape="plaintext")
                 dot.edge("N", "1", label="N:1", arrowhead="none", arrowtail="crow", dir="both")
-                # SQL: N(B) 기준 LEFT JOIN 1(A)
                 sql = f"SELECT\n    A.{pk_b},\n    A.{top_m['B_column']},\n    B.{pk_a}\nFROM {profile_b.table_name} A\nLEFT JOIN {profile_a.table_name} B\n    ON A.{top_m['B_column']} = B.{top_m['A_column']}\nWHERE A.{top_m['B_column']} IS NOT NULL;"
             else: # 1:1
                 dot.node("L", label=make_node(profile_a.table_name, pk_a, top_m['A_column']), shape="plaintext")
@@ -195,7 +218,6 @@ if file_a:
             st.graphviz_chart(dot)
             st.markdown(f"**📜 비즈니스 로직 기반 SQL 쿼리 추천 (적용 관계: {rel_final})**")
             st.code(sql, language="sql")
-            st.success(f"✅ Many(N)쪽 테이블의 PK({pk_a if rel_final=='N:1' else pk_b})를 포함하여 분석을 완료했습니다.")
             
     except Exception as e:
         st.error(f"오류: {e}")
