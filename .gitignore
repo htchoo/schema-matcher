@@ -1,0 +1,20 @@
+# .gitignore
+.env
+.streamlit/secrets.toml
+*.pyc
+
+# 가상환경 제외
+venv/
+.venv/
+env/
+
+# 파이썬 캐시 파일 제외
+__pycache__/
+*.py[cod]
+
+# 스트림릿 설정 및 보안 파일 제외
+.streamlit/secrets.toml
+
+# 기타 OS 파일
+.DS_Store
+Thumbs.db
