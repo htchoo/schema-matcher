@@ -64,7 +64,14 @@ def get_cached_profile(file_bytes, table_id, sheet_name):
 @st.cache_data(ttl=3600, show_spinner=False) 
 def load_catalog_from_neon():
     try:
-        db_url = "postgresql://neondb_owner:npg_p1S5sHjFXYfm@ep-fancy-queen-a15e3itu-pooler.ap-southeast-1.aws.neon.tech:5432/neondb?sslmode=require"
+        # [수정] secrets.toml에 있는 개별 정보를 가져와서 URL로 안전하게 조립합니다.
+        pg_user = st.secrets["PG_USER"]
+        pg_pwd = st.secrets["PG_PASSWORD"]
+        pg_host = st.secrets["PG_HOST"]
+        pg_port = st.secrets["PG_PORT"]
+        pg_db = st.secrets["PG_DATABASE"]
+        
+        db_url = f"postgresql://{pg_user}:{pg_pwd}@{pg_host}:{pg_port}/{pg_db}?sslmode=require"
         conn = st.connection("neon_db", type="sql", url=db_url)
         
         tbl_df = conn.query('SELECT * FROM tbl_ctlg_m')
@@ -147,7 +154,6 @@ w_value = st.sidebar.number_input("Value Overlap", 0.0, 1.0, 0.60, 0.05)
 weights_tuple = (w_name, w_type, w_value)
 st.sidebar.markdown("---")
 
-# UI에서 제거된 라디오 버튼 (에러 방지를 위해 변수만 기본값으로 내부 선언)
 rel_type_input = "자동 탐지" 
 
 st.sidebar.subheader("📂 카탈로그 PJT 우선순위")
@@ -319,7 +325,7 @@ if file_a:
                     where_target_pk = pk_b if pk_b else selected_keys.iloc[0]['B_column']
                     join_conds = "\n    AND ".join([f"A.{r['A_column']} = B.{r['B_column']}" for _, r in selected_keys.iterrows()])
                     
-                    formatted_sql = f"""SELECT \n    A.*, \n    B.* \nFROM {profile_a.table_name} A \n{sql_join_type} {profile_b.table_name} B \nON {join_conds}\nWHERE 1=1\nAND B.{where_target_pk} IS NOT NULL;"""
+                    formatted_sql = f"""SELECT \n    A.*, \n    B.* FROM {profile_a.table_name} A \n{sql_join_type} {profile_b.table_name} B \nON {join_conds}\nWHERE 1=1\nAND B.{where_target_pk} IS NOT NULL;"""
                     
                     st.markdown(f"**📜 비즈니스 로직 기반 SQL 쿼리 추천**")
                     st.code(formatted_sql, language="sql")
