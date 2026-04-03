@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import io
 from graphviz import Digraph
@@ -40,13 +41,14 @@ st.set_page_config(page_title="스키마 탐지기 Pro", layout="wide")
 st.title("🔍 테이블 스키마 탐지 & Join Key 분석기")
 
 # ---------------------------------------------------------
-# [데이터 정제 및 캐싱] - 전수 분석 보장
+# [데이터 정제 및 캐싱] 
 # ---------------------------------------------------------
 def clean_df(df):
     if df is None: return None
     df = df.dropna(how='all').copy()
-    for col in df.select_dtypes(include=['object']).columns:
+    for col in df.columns:
         df[col] = df[col].astype(str).str.strip().str.upper()
+        df[col] = df[col].replace(['NAN', 'NONE', 'NAT', '<NA>'], pd.NA)
     return df
 
 @st.cache_data(show_spinner=False)
@@ -57,31 +59,63 @@ def get_cached_profile(file_bytes, table_id, sheet_name):
     return profile
 
 # ---------------------------------------------------------
-# [로직 고정] 카탈로그 실전 정밀 매핑 (English Name 기반 분석)
+# 🔌 Neon DB 실시간 연결 및 스키마 원본 데이터 로드
 # ---------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False) 
+def load_catalog_from_neon():
+    try:
+        db_url = "postgresql://neondb_owner:npg_p1S5sHjFXYfm@ep-fancy-queen-a15e3itu-pooler.ap-southeast-1.aws.neon.tech:5432/neondb?sslmode=require"
+        conn = st.connection("neon_db", type="sql", url=db_url)
+        
+        tbl_df = conn.query('SELECT * FROM tbl_ctlg_m')
+        col_df = conn.query('SELECT * FROM col_ctlg_m')
+        
+        tbl_df.columns = [c.lower() for c in tbl_df.columns]
+        col_df.columns = [c.lower() for c in col_df.columns]
+        
+        if 'tbl_kor_desc' in tbl_df.columns and 'tbl_kor_name' in tbl_df.columns:
+            tbl_df['tbl_kor_desc'] = tbl_df['tbl_kor_desc'].replace(r'^\s*$', pd.NA, regex=True).fillna(tbl_df['tbl_kor_name'])
+            
+        if 'col_kor_desc' in col_df.columns and 'col_kor_name' in col_df.columns:
+            col_df['col_kor_desc'] = col_df['col_kor_desc'].replace(r'^\s*$', pd.NA, regex=True).fillna(col_df['col_kor_name'])
+        
+        return tbl_df, col_df
+    except Exception as e:
+        st.sidebar.error(f"⚠️ Neon DB 연결 실패: {e}")
+        return pd.DataFrame(), pd.DataFrame()
+
+tbl_ctlg_m, col_ctlg_m = load_catalog_from_neon()
+
+def get_actual_pjts_from_catalog():
+    if tbl_ctlg_m.empty and col_ctlg_m.empty:
+        return ["DB 연결 필요"]
+    pjt_tbl = tbl_ctlg_m['pjt'].dropna().unique().tolist() if 'pjt' in tbl_ctlg_m.columns else []
+    pjt_col = col_ctlg_m['pjt'].dropna().unique().tolist() if 'pjt' in col_ctlg_m.columns else []
+    pjts = sorted(list(set(pjt_tbl + pjt_col)))
+    return pjts if pjts else ["PJT 없음"]
+
 def lookup_catalog_report(names, pjts, type='table'):
     results = []
-    tbl_master = {
-        "TRSALE_ORD_STAT_D": {"LG D2C": ("주문 현황 일적재", "일별 주문 및 판매 상태 트랜잭션 정보")},
-        "VRCOMN_MODEL_INFO_M": {"LG D2C": ("모델 마스터 정보", "공용 제품 모델에 대한 표준 규격 마스터")}
-    }
-    col_master = {
-        "MODEL_CODE": {"LG D2C": ("모델코드", "제품 식별 고유 8자리 코드")},
-        "ITEM_ID": {"LG D2C": ("아이템ID", "주문 품목별 고유 식별 번호")},
-        "CMPNY": {"LG D2C": ("사업본부", "LG/삼성 등 제조 법인 구분 정보")},
-        "ORD_DATE": {"LG D2C": ("주문일자", "YYYYMMDD 형식의 실적 발생일")}
-    }
+    df_target = tbl_ctlg_m if type == 'table' else col_ctlg_m
+    name_col = 'tbl_name' if type == 'table' else 'col_name'
+    if df_target.empty or name_col not in df_target.columns or 'pjt' not in df_target.columns:
+        for name in names:
+            results.append({name_col: name, "pjt": "-", "info": "DB 테이블 또는 컬럼 구조 에러"})
+        return pd.DataFrame(results)
     for name in names:
         found = False
-        master = tbl_master if type == 'table' else col_master
-        if name in master:
+        match_df = df_target[df_target[name_col] == name]
+        if not match_df.empty:
             for pjt in pjts:
-                if pjt in master[name]:
-                    kor, info = master[name][pjt]
-                    results.append({"English_Name": name, "PJT": pjt, "Korean_Name": kor, "Business_Info": info})
+                pjt_match = match_df[match_df['pjt'] == pjt]
+                if not pjt_match.empty:
+                    results.append(pjt_match.iloc[0].to_dict())
                     found = True; break
         if not found:
-            results.append({"English_Name": name, "PJT": "-", "Korean_Name": "미등록", "Business_Info": "정보 없음"})
+            default_row = {name_col: name, "pjt": "-"}
+            if type == 'table': default_row.update({"tbl_kor_name": "미등록", "tbl_kor_desc": "카탈로그 정보 없음"})
+            else: default_row.update({"col_kor_name": "미등록", "col_kor_desc": "카탈로그 정보 없음"})
+            results.append(default_row)
     return pd.DataFrame(results)
 
 # ---------------------------------------------------------
@@ -105,21 +139,23 @@ def analyze_strategic_pks(df):
 # ---------------------------------------------------------
 # 2. 사이드바 (레이아웃 고정)
 # ---------------------------------------------------------
+st.sidebar.markdown("""<style>div[data-baseweb="select"] input {caret-color: transparent !important;}</style>""", unsafe_allow_html=True)
 st.sidebar.header("⚙️ 분석 설정")
 w_name = st.sidebar.number_input("Name Similarity", 0.0, 1.0, 0.30, 0.05)
 w_type = st.sidebar.number_input("Type Similarity", 0.0, 1.0, 0.10, 0.05)
 w_value = st.sidebar.number_input("Value Overlap", 0.0, 1.0, 0.60, 0.05)
 weights_tuple = (w_name, w_type, w_value)
-
 st.sidebar.markdown("---")
-rel_type_input = st.sidebar.radio("테이블 관계 설정", ["자동 탐지", "1:1", "1:N", "N:1"], index=0)
 
-st.sidebar.markdown("---")
+# UI에서 제거된 라디오 버튼 (에러 방지를 위해 변수만 기본값으로 내부 선언)
+rel_type_input = "자동 탐지" 
+
 st.sidebar.subheader("📂 카탈로그 PJT 우선순위")
-priority_list = ["LG D2C", "PJT_A", "PJT_B"]
-pjt_1 = st.sidebar.selectbox("우선순위 1", priority_list, index=0)
-pjt_2 = st.sidebar.selectbox("우선순위 2", ["None"] + priority_list, index=0)
-priority_pjts = [p for p in [pjt_1, pjt_2] if p != "None"]
+catalog_pjt_list = get_actual_pjts_from_catalog()
+pjt_1 = st.sidebar.selectbox("우선순위 1", catalog_pjt_list, index=0)
+idx_2 = 1 if len(catalog_pjt_list) > 1 else 0
+pjt_2 = st.sidebar.selectbox("우선순위 2", catalog_pjt_list, index=idx_2)
+priority_pjts = [pjt_1, pjt_2]
 
 # ---------------------------------------------------------
 # 3. 메인 레이아웃 (파일 업로드 및 분석)
@@ -130,7 +166,6 @@ with col_up1:
     if file_a:
         xl_a = pd.ExcelFile(io.BytesIO(file_a.getvalue()))
         sheet_a = st.selectbox("분석 시트 선택 (Source)", xl_a.sheet_names, index=len(xl_a.sheet_names)-1)
-
 with col_up2:
     file_b = st.file_uploader("타겟(Target) 테이블 업로드 (선택)", type=["xlsx"], key="file_b")
     if file_b:
@@ -143,10 +178,8 @@ if file_a:
         df_source_meta, _ = summarize_table_profile(profile_a)
         full_nunique_map_a = {col: profile_a.sample_df[col].nunique() for col in profile_a.sample_df.columns}
         row_count_a = len(profile_a.sample_df)
-        
         df_pk_res_a, _ = analyze_strategic_pks(profile_a.sample_df)
-        pk_a = df_pk_res_a.iloc[0]["컬럼 1"] if not df_pk_res_a.empty else "MODEL_CODE"
-
+        pk_a = df_pk_res_a.iloc[0]["컬럼 1"] if not df_pk_res_a.empty else None
         st.success(f"전수 분석 완료 (유효 행 수: {row_count_a}) ✅")
         st.subheader("1. 소스 테이블 스키마 및 데이터 분석")
         c_main, c_side = st.columns([2, 1])
@@ -158,117 +191,183 @@ if file_a:
             ), use_container_width=True)
         with c_side:
             st.markdown("**📌 PK 후보 데이터 중복 상세 분석**")
-            dupes = profile_a.sample_df[pk_a].value_counts()
-            st.table(pd.DataFrame({"중복 데이터": dupes[dupes>1].index, "건수": dupes[dupes>1].values}).head(10))
-
+            if pk_a:
+                dupes = profile_a.sample_df[pk_a].value_counts()
+                st.table(pd.DataFrame({"중복 데이터": dupes[dupes>1].index, "건수": dupes[dupes>1].values}).head(10))
+        
         st.markdown("### 📊 상세 PK 분석 결과")
         st.table(df_pk_res_a)
+        
+        if not df_pk_res_a.empty:
+            confirmed_pks = df_pk_res_a[df_pk_res_a["상태"] == "✅ 확정"]["컬럼 1"].tolist()
+            if confirmed_pks:
+                st.markdown("##### 🔑 확정 PK 컬럼 카탈로그 정보")
+                df_confirmed_cat = lookup_catalog_report(confirmed_pks, priority_pjts, type='column')
+                st.table(df_confirmed_cat)
 
         if file_b:
             profile_b = get_cached_profile(file_b.getvalue(), "TGT", sheet_b)
-            all_matches = match_schemas(profile_a, profile_b, weights=weights_tuple)
-            
             row_count_b = len(profile_b.sample_df)
-            full_nunique_map_b = {col: profile_b.sample_df[col].nunique() for col in profile_b.sample_df.columns}
             df_pk_res_b, _ = analyze_strategic_pks(profile_b.sample_df)
-            pk_b = df_pk_res_b.iloc[0]["컬럼 1"] if not df_pk_res_b.empty else "ITEM_ID"
+            pk_b = df_pk_res_b.iloc[0]["컬럼 1"] if not df_pk_res_b.empty else None
 
-            for m in all_matches:
-                a_col, b_col = m['A_column'], m['B_column']
-                is_pk_a = (full_nunique_map_a.get(a_col, 0) == row_count_a)
-                is_pk_b = (full_nunique_map_b.get(b_col, 0) == row_count_b)
+            file_sig = f"{file_a.name}_{file_a.size}_{sheet_a}_{file_b.name}_{file_b.size}_{sheet_b}_{w_name}_{w_type}_{w_value}"
+            if st.session_state.get("last_run_sig") != file_sig:
+                with st.spinner("🔍 타겟 데이터 전수 분석 및 조인 키 매칭을 진행 중입니다..."):
+                    all_matches_raw = match_schemas(profile_a, profile_b, weights=weights_tuple)
+                    full_nunique_map_b = {col: profile_b.sample_df[col].nunique() for col in profile_b.sample_df.columns}
+                    existing_pairs = {(m['A_column'], m['B_column']) for m in all_matches_raw}
+                    common_cols = set(profile_a.sample_df.columns).intersection(set(profile_b.sample_df.columns))
+                    for col in common_cols:
+                        if (col, col) not in existing_pairs:
+                            all_matches_raw.append({'A_column': col, 'B_column': col, 'name_similarity': 1.0, 'type_similarity': 1.0})
+                    seen_pairs = set(); final_list = []
+                    for m in all_matches_raw:
+                        a_col, b_col = m['A_column'], m['B_column']
+                        if (a_col, b_col) in seen_pairs: continue
+                        seen_pairs.add((a_col, b_col))
+                        if a_col in profile_a.sample_df.columns and b_col in profile_b.sample_df.columns:
+                            set_a = set(profile_a.sample_df[a_col].dropna().unique()); set_b = set(profile_b.sample_df[b_col].dropna().unique())
+                            m['value_overlap'] = len(set_a.intersection(set_b)) / len(set_a) if set_a else 0.0
+                        else: m['value_overlap'] = 0.0
+                        m['score'] = (m.get('name_similarity', 0) * w_name) + (m.get('type_similarity', 0) * w_type) + (m['value_overlap'] * w_value)
+                        is_pk_a = (full_nunique_map_a.get(a_col, 0) == row_count_a); is_pk_b = (full_nunique_map_b.get(b_col, 0) == row_count_b)
+                        if is_pk_a and is_pk_b: m['relationship_detected'] = "1:1"
+                        elif is_pk_a and not is_pk_b: m['relationship_detected'] = "1:N"
+                        elif not is_pk_a and is_pk_b: m['relationship_detected'] = "N:1"
+                        else: m['relationship_detected'] = "N:M"
+                        m['is_valid_pk_match'] = (is_pk_a or is_pk_b) and (a_col == b_col)
+                        if m['score'] >= 0.9 or m['is_valid_pk_match']: m['match_type'] = 'strong'
+                        elif m['score'] >= 0.6: m['match_type'] = 'candidate'
+                        else: m['match_type'] = 'weak'
+                        final_list.append(m)
+                    all_matches_sorted = sorted(final_list, key=lambda x: ({'strong': 0, 'candidate': 1, 'weak': 2}.get(x['match_type'], 3), -x['score']))
+                    st.session_state["match_results"] = all_matches_sorted
+                    st.session_state["last_run_sig"] = file_sig
+                    if "applied_keys" in st.session_state: del st.session_state["applied_keys"]
+
+            all_matches_sorted = st.session_state["match_results"]
+            
+            if rel_type_input != "자동 탐지":
+                all_matches_sorted = [m for m in all_matches_sorted if m['relationship_detected'] == rel_type_input]
+                header_text = f"사용자가 정의한 관계: {rel_type_input}"
+            else:
+                top_m = all_matches_sorted[0] if all_matches_sorted else {}
+                header_text = f"시스템이 탐지한 관계: {top_m.get('relationship_detected', 'N:M')}"
+
+            st.subheader(f"2. 소스 ↔ 타겟 매칭 결과 선택 ({header_text})")
+
+            if not all_matches_sorted and rel_type_input != "자동 탐지":
+                st.warning(f"⚠️ 현재 데이터 프로파일 분석 결과, 두 테이블 간에 '{rel_type_input}' 관계를 만족하는 조인 키(PK/FK 등) 조합이 존재하지 않습니다.")
+            else:
+                sel_types = st.multiselect("Match Type 필터", ["strong", "candidate", "weak"], default=["strong", "candidate"])
+                df_display = pd.DataFrame(all_matches_sorted)
+                df_display = df_display[df_display['match_type'].isin(sel_types)].copy().reset_index(drop=True)
+                df_display.insert(0, 'Select', False)
                 
-                # 점수 및 Overlap 재계산 (전수 분석 동기화)
-                set_a = set(profile_a.sample_df[a_col].dropna().unique())
-                set_b = set(profile_b.sample_df[b_col].dropna().unique())
-                m['value_overlap'] = len(set_a.intersection(set_b)) / len(set_a) if set_a else 0.0
-                m['score'] = (m['name_similarity'] * w_name) + (m['type_similarity'] * w_type) + (m['value_overlap'] * w_value)
-                
-                if is_pk_a and is_pk_b: m['relationship_detected'] = "1:1"
-                elif is_pk_a and not is_pk_b: m['relationship_detected'] = "1:N"
-                elif not is_pk_a and is_pk_b: m['relationship_detected'] = "N:1"
-                else: m['relationship_detected'] = "N:M"
-                
-                m['is_valid_pk_match'] = (is_pk_a or is_pk_b) and (a_col == b_col)
-                if m['score'] >= 0.9 or m['is_valid_pk_match']: m['match_type'] = 'strong'
-                elif m['score'] >= 0.6: m['match_type'] = 'candidate'
-                else: m['match_type'] = 'weak'
+                if "applied_keys" in st.session_state:
+                    if not st.session_state['applied_keys'].empty and not df_display.empty:
+                        applied_pairs = set(zip(st.session_state['applied_keys']['A_column'], st.session_state['applied_keys']['B_column']))
+                        mask = df_display.apply(lambda r: (r['A_column'], r['B_column']) in applied_pairs, axis=1)
+                        df_display.loc[mask, 'Select'] = True
+                else:
+                    if not df_display.empty:
+                        df_display.loc[0, 'Select'] = True; st.session_state['applied_keys'] = df_display[df_display['Select'] == True]
 
-            # 정렬 및 필터링
-            filtered_matches = [m for m in all_matches if m.get('match_type') != 'weak' or m.get('is_valid_pk_match')]
-            type_priority = {'strong': 0, 'candidate': 1, 'weak': 2}
-            filtered_matches = sorted(filtered_matches, key=lambda x: (type_priority.get(x['match_type'], 3), -x['score']))
-            
-            top_m = filtered_matches[0]
-            rel_final = rel_type_input if rel_type_input != "자동 탐지" else top_m['relationship_detected']
-            
-            st.subheader(f"2. 소스 ↔ 타겟 매칭 추천 결과 (시스템이 탐지한 관계: {rel_final})")
-            display_cols = ['A_column', 'B_column', 'name_similarity', 'type_similarity', 'value_overlap', 'score', 'relationship_detected', 'match_type']
-            st.dataframe(pd.DataFrame(filtered_matches)[display_cols].reset_index(drop=True), use_container_width=True)
+                edited_df = st.data_editor(
+                    df_display[['Select', 'A_column', 'B_column', 'name_similarity', 'type_similarity', 'value_overlap', 'score', 'relationship_detected', 'match_type']],
+                    column_config={"Select": st.column_config.CheckboxColumn("선택", default=False)},
+                    disabled=['A_column', 'B_column', 'name_similarity', 'type_similarity', 'value_overlap', 'score', 'relationship_detected', 'match_type'],
+                    hide_index=True, use_container_width=True, key="join_selector"
+                )
 
-            st.subheader("3. JOIN KEY 후보 및 ERD 분석 결과")
-            dot = Digraph(comment="ERD"); dot.attr(rankdir="LR")
-            def make_node(t_name, pk_col, join_col):
-                cols = []
-                if pk_col: cols.append(('PK', pk_col))
-                if join_col and join_col != pk_col: cols.append(('JOIN', join_col))
-                rows = "".join([f'<TR><TD ALIGN="LEFT" BGCOLOR="{"#D1E9F6" if c[1]==join_col else "white"}">{"🔑 " if c[0]=="PK" else "   "}{c[1]}</TD></TR>' for c in cols])
-                return f'<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0"><TR><TD BGCOLOR="#F4B2AF"><B>{t_name}</B></TD></TR>{rows}</TABLE>>'
+                if st.button("🚀 선택한 조인 키 적용 (ERD 및 SQL 업데이트)"):
+                    st.session_state['applied_keys'] = edited_df[edited_df['Select'] == True]
+                    st.rerun()
 
-            dot.node("A", label=make_node(profile_a.table_name, pk_a, top_m['A_column']), shape="plaintext")
-            dot.node("B", label=make_node(profile_b.table_name, pk_b, top_m['B_column']), shape="plaintext")
-            
-            if rel_final == "N:1": dot.edge("A", "B", label="N:1", arrowhead="none", arrowtail="crow", dir="both")
-            elif rel_final == "1:N": dot.edge("A", "B", label="1:N", arrowhead="crow", arrowtail="none", dir="both")
-            else: dot.edge("A", "B", label=rel_final, dir="both")
-            st.graphviz_chart(dot)
+                selected_keys = st.session_state.get('applied_keys', pd.DataFrame())
 
-            st.markdown(f"**📜 비즈니스 로직 기반 SQL 쿼리 추천 (적용 관계: {rel_final})**")
-            formatted_sql = f"""
-SELECT 
-    A.{pk_a if pk_a else '*'}, 
-    B.{pk_b if pk_b else '*'}
-FROM {profile_a.table_name} A
-LEFT JOIN {profile_b.table_name} B 
-    ON A.{top_m['A_column']} = B.{top_m['B_column']}
-WHERE A.{top_m['A_column']} IS NOT NULL;
-            """
-            st.code(formatted_sql, language="sql")
+                if not selected_keys.empty:
+                    rel_rank = {"N:M": 3, "N:1": 2, "1:N": 2, "1:1": 1}
+                    sorted_rels = sorted(selected_keys['relationship_detected'].tolist(), key=lambda x: rel_rank.get(x, 0), reverse=True)
+                    rel_final = rel_type_input if rel_type_input != "자동 탐지" else sorted_rels[0]
 
-            # ---------------------------------------------------------
-            # 4. [요청 반영] 시인성이 강화된 상세 분석 리포트 (최하단)
-            # ---------------------------------------------------------
-            st.markdown("---")
-            st.subheader("📂 카탈로그 매핑 및 비즈니스 상세 분석 리포트")
-            
-            df_tbl_rpt = lookup_catalog_report([profile_a.table_name, profile_b.table_name], priority_pjts, type='table')
-            df_col_rpt = lookup_catalog_report(list(set([pk_a, pk_b, top_m['A_column'], top_m['B_column']])), priority_pjts, type='column')
-            
-            src_cat = df_tbl_rpt[df_tbl_rpt['English_Name']==profile_a.table_name].iloc[0]
-            tgt_cat = df_tbl_rpt[df_tbl_rpt['English_Name']==profile_b.table_name].iloc[0]
-            key_cat = df_col_rpt[df_col_rpt['English_Name']==top_m['A_column']].iloc[0]
-            
-            # [요청 반영] HTML 태그를 활용하여 특정 단어만 글자 크기 + 볼딩 처리
-            st.markdown(f"""
-            <div style="background-color: #e8f4f9; padding: 20px; border-radius: 10px; border-left: 5px solid #2196F3;">
-                <h4 style="margin-top: 0; color: #0c5460;">📝 데이터 아키텍처 분석 요약</h4>
-                <ul style="margin-bottom: 0; line-height: 1.8;">
-                    <li><b>업무 관계</b>: 소스 테이블 <span style="font-size:1.15em;"><b>{src_cat['Korean_Name']}</b></span>와(과) 타겟 테이블 <span style="font-size:1.15em;"><b>{tgt_cat['Korean_Name']}</b></span>는(은) <span style="font-size:1.25em; color: #d63384;"><b>{rel_final}</b></span> 관계를 맺고 있습니다.</li>
-                    <li><b>데이터 흐름</b>: <code>{src_cat['Business_Info']}</code> 데이터가 <code>{tgt_cat['Business_Info']}</code> 기준 정보를 참조하여 관리되는 구조입니다.</li>
-                    <li><b>핵심 조인 키</b>: 비즈니스 공통 키인 <span style="font-size:1.15em;"><b>{key_cat['English_Name']}</b></span>(<span style="font-size:1.1em;"><b>{key_cat['Korean_Name']}</b></span>)를 매개체로 조인됩니다. ({key_cat['Business_Info']})</li>
-                    <li><b>분석 가이드</b>: 조인 시 <span style="font-size:1.2em;"><b>{rel_final}</b></span> 구조에 따라 데이터 정합성을 확인해야 하며, 특히 <span style="font-size:1.15em;"><b>{key_cat['Korean_Name']}</b></span>의 미매핑 데이터 발생 여부를 모니터링하는 것이 권장됩니다.</li>
-                </ul>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            st.write("") # 간격 조절
-            rpt_col1, rpt_col2 = st.columns(2)
-            with rpt_col1:
-                st.markdown("##### 📋 테이블 카탈로그 (`tbl_ctlg_m`) 상세")
-                st.table(df_tbl_rpt)
-            with rpt_col2:
-                st.markdown("##### 📑 컬럼 카탈로그 (`col_ctlg_m`) 상세")
-                st.dataframe(df_col_rpt, use_container_width=True)
+                    st.subheader(f"3. JOIN KEY 후보 및 ERD 분석 결과 (적용 관계: {rel_final})")
+                    dot = Digraph(comment="ERD"); dot.attr(rankdir="LR")
+                    def make_node(t_name, pk, join_cols):
+                        rows = [f'<TR><TD BGCOLOR="#F4B2AF"><B>{t_name}</B></TD></TR>']
+                        if pk: rows.append(f'<TR><TD ALIGN="LEFT">🔑 {pk}</TD></TR>')
+                        for c in join_cols:
+                            if c != pk: rows.append(f'<TR><TD ALIGN="LEFT" BGCOLOR="#D1E9F6">   {c}</TD></TR>')
+                        return f'<<TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0">{"".join(rows)}</TABLE>>'
+                    dot.node("A", label=make_node(profile_a.table_name, pk_a, selected_keys['A_column'].tolist()), shape="plaintext")
+                    dot.node("B", label=make_node(profile_b.table_name, pk_b, selected_keys['B_column'].tolist()), shape="plaintext")
+                    if rel_final == "N:1": dot.edge("A", "B", label="N:1", arrowhead="none", arrowtail="crow", dir="both")
+                    elif rel_final == "1:N": dot.edge("A", "B", label="1:N", arrowhead="crow", arrowtail="none", dir="both")
+                    elif rel_final == "N:M": dot.edge("A", "B", label="N:M", arrowhead="crow", arrowtail="crow", dir="both")
+                    else: dot.edge("A", "B", label=rel_final, dir="both")
+                    st.graphviz_chart(dot)
 
-    except Exception as e:
-        st.error(f"오류: {e}")
+                    sql_join_type = "LEFT JOIN"
+                    if rel_final == "1:1":
+                        sql_join_type = "INNER JOIN"
+                    elif rel_final == "1:N" or rel_final == "N:1":
+                        sql_join_type = "LEFT JOIN"
+                    elif rel_final == "N:M":
+                        sql_join_type = "INNER JOIN"
+
+                    where_target_pk = pk_b if pk_b else selected_keys.iloc[0]['B_column']
+                    join_conds = "\n    AND ".join([f"A.{r['A_column']} = B.{r['B_column']}" for _, r in selected_keys.iterrows()])
+                    
+                    formatted_sql = f"""SELECT \n    A.*, \n    B.* \nFROM {profile_a.table_name} A \n{sql_join_type} {profile_b.table_name} B \nON {join_conds}\nWHERE 1=1\nAND B.{where_target_pk} IS NOT NULL;"""
+                    
+                    st.markdown(f"**📜 비즈니스 로직 기반 SQL 쿼리 추천**")
+                    st.code(formatted_sql, language="sql")
+                    
+                    copy_html = f"""
+                    <div style="margin-top: 5px;">
+                        <textarea id="sql_code" style="position: absolute; left: -9999px;">{formatted_sql}</textarea>
+                        <button onclick="copyToClipboard()" style="background-color: #ffffff; border: 1px solid #d1d5db; color: #374151; padding: 6px 14px; cursor: pointer; border-radius: 6px; font-weight: 500;">📋 SQL 구문 복사하기</button>
+                        <script>
+                        function copyToClipboard() {{
+                            var copyText = document.getElementById("sql_code");
+                            copyText.select(); document.execCommand("copy");
+                            var btn = document.querySelector("button");
+                            btn.innerHTML = "✅ 복사 완료!";
+                            setTimeout(function() {{ btn.innerHTML = "📋 SQL 구문 복사하기"; }}, 2000);
+                        }}
+                        </script>
+                    </div>"""
+                    components.html(copy_html, height=50)
+
+                    st.markdown("---")
+                    st.subheader("📂 카탈로그 매핑 및 비즈니스 상세 분석 리포트")
+                    df_tbl_rpt = lookup_catalog_report([profile_a.table_name, profile_b.table_name], priority_pjts, type='table')
+                    catalog_cols = list(set([c for c in [pk_a, pk_b] + selected_keys['A_column'].tolist() + selected_keys['B_column'].tolist() if c]))
+                    df_col_rpt = lookup_catalog_report(catalog_cols, priority_pjts, type='column')
+                    
+                    src_cat = df_tbl_rpt[df_tbl_rpt['tbl_name']==profile_a.table_name].iloc[0].to_dict() if not df_tbl_rpt.empty and 'tbl_name' in df_tbl_rpt.columns and len(df_tbl_rpt[df_tbl_rpt['tbl_name']==profile_a.table_name]) > 0 else {}
+                    tgt_cat = df_tbl_rpt[df_tbl_rpt['tbl_name']==profile_b.table_name].iloc[0].to_dict() if not df_tbl_rpt.empty and 'tbl_name' in df_tbl_rpt.columns and len(df_tbl_rpt[df_tbl_rpt['tbl_name']==profile_b.table_name]) > 0 else {}
+                    
+                    src_cat_name = src_cat.get('tbl_kor_name', profile_a.table_name)
+                    tgt_cat_name = tgt_cat.get('tbl_kor_name', profile_b.table_name)
+                    src_cat_desc = src_cat.get('tbl_kor_desc', '정보 없음')
+                    tgt_cat_desc = tgt_cat.get('tbl_kor_desc', '정보 없음')
+
+                    key_names_html = " + ".join([f"<b>{k}</b>" for k in selected_keys['A_column'].tolist()])
+                    st.markdown(f"""
+                    <div style="background-color: #e8f4f9; padding: 22px; border-radius: 12px; border-left: 6px solid #2196F3;">
+                        <h4 style="margin-top: 0; color: #0c5460;">📝 데이터 아키텍처 분석 요약</h4>
+                        <ul style="line-height: 2.0;">
+                            <li><b>업무 관계</b>: 소스 테이블 <b>{src_cat_name}</b>와(과) 타겟 테이블 <b>{tgt_cat_name}</b>는(은) <span style="color: #d63384;"><b>{rel_final}</b></span> 관계로 연결됩니다.</li>
+                            <li><b>핵심 조인 키</b>: 현재 {key_names_html} 조합을 통해 조인 분석이 수행되고 있습니다.</li>
+                            <li><b>비즈니스 흐름</b>: <code>{src_cat_desc}</code> 실적 데이터를 <code>{tgt_cat_desc}</code> 기준 정보를 통해 심화 분석할 수 있는 구조입니다.</li>
+                        </ul>
+                    </div>""", unsafe_allow_html=True)
+                    st.write("")
+                    st.markdown("##### 📋 테이블 카탈로그 상세")
+                    st.table(df_tbl_rpt)
+                    st.markdown("##### 📑 컬럼 카탈로그 상세")
+                    st.dataframe(df_col_rpt, use_container_width=True)
+                else: st.warning("분석할 Join Key의 체크박스를 선택한 후 '적용' 버튼을 눌러주세요.")
+    except Exception as e: st.error(f"오류: {e}")
